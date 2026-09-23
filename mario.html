@@ -1,0 +1,845 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Evil Mario — Corrupted Single File (Full)</title>
+<style>
+  :root{--bg:#070007;--card:#0f0f0f;--accent:#ff3344}
+  html,body{height:100%;margin:0;background:linear-gradient(#20000a,#070007);font-family:monospace;color:#eee}
+  #wrap{display:flex;flex-direction:column;align-items:center;padding:8px;gap:8px}
+  canvas{background:#000;border:4px solid #111;image-rendering:pixelated;display:block;max-width:calc(100vw - 20px)}
+  #hud{width:896px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .panel{background:rgba(0,0,0,.45);padding:8px;border-radius:6px;border:1px solid rgba(255,0,0,.06)}
+  #start,#end{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:linear-gradient(#180004,#050003);padding:26px;border-radius:12px;border:2px solid #440011;color:#fff;max-width:760px;z-index:30;display:none}
+  button{background:#220005;color:#fff;padding:8px 12px;border-radius:6px;border:1px solid #440011;cursor:pointer}
+  .hearts{display:inline-flex;gap:6px}
+  .heart{width:18px;height:18px;border-radius:4px;background:linear-gradient(#ff9999,#aa0000)}
+  .muted{opacity:.8;font-size:12px}
+  @media (max-width:920px){canvas{width:calc(100vw - 20px)}#hud{width:calc(100vw - 20px)}}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <div class="panel">
+      <strong style="color:#ff4455">EVIL MARIO: CORRUPTED RUN</strong>
+      <div class="muted">← → to move • ↑ jump (hold for height) • Space dash • R restart</div>
+    </div>
+    <div class="panel muted" id="timer">00:00:00</div>
+    <div class="panel"><span class="hearts" id="hearts"></span></div>
+  </div>
+
+  <canvas id="game" width="896" height="512"></canvas>
+</div>
+
+<!-- Overlays -->
+<div id="start">
+  <h1 style="color:#ff6666">THE CASTLE ROT</h1>
+  <p>Dark, punishing and deceptive. Expect many deaths. 3 checkpoints. Fake flags. Mirror zones. Rising lava chase. Boss at the end.</p>
+  <div style="margin-top:10px;">
+    <button id="btn-start">Enter the corruption</button>
+  </div>
+</div>
+
+<div id="end">
+  <h1 id="end-title"></h1>
+  <p id="end-msg"></p>
+  <p>Time: <span id="end-time"></span> • Deaths: <span id="end-deaths"></span></p>
+  <div style="margin-top:12px;"><button id="btn-restart">Play again</button></div>
+</div>
+
+<script>
+/* --------------------------------------------
+   Evil Mario — Full Single-file Game
+   - Canvas rendering
+   - requestAnimationFrame loop
+   - AABB tile collision
+   - Player: move, variable jump, double jump,
+     wall slide + wall jump, dash (space), stomp
+   - Enemies: walker, flyer, projectiles
+   - Moving platforms, collapsing platforms,
+     fake platforms, spikes, lava (rising)
+   - Mirror zone (reversed controls)
+   - Checkpoints (3), fake exits, secret shortcut
+   - Boss gauntlet and true exit
+   - Timer, death counter
+   -------------------------------------------- */
+
+/* -------------------- Setup -------------------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha:false });
+const W = canvas.width, H = canvas.height;
+const TILE = 32;
+const GRAV = 1400;
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+let running = false;
+let lastTime = 0;
+let elapsedSeconds = 0;
+let timerInterval = null;
+let deathCount = 0;
+
+/* -------------------- Sound helpers -------------------- */
+function sfx(freq=440,dur=0.08,type='sine',vol=0.12){
+  if(!audioCtx) return;
+  const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+  o.type=type; o.frequency.value=freq; g.gain.value=vol;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime+dur);
+}
+function playJump(){ sfx(520,0.06,'triangle',0.12) }
+function playStomp(){ sfx(160,0.08,'square',0.16); sfx(320,0.04,'sine',0.08) }
+function playDeath(){ sfx(80,0.6,'sawtooth',0.25) }
+function playWin(){ sfx(880,0.1,'sine',0.12); sfx(1200,0.15,'sine',0.12) }
+
+/* -------------------- Input -------------------- */
+const keys = {left:false,right:false,jump:false,attack:false,restart:false};
+let jumpJustPressed = false;
+window.addEventListener('keydown', e=>{
+  if(e.key === 'ArrowLeft') keys.left = true;
+  if(e.key === 'ArrowRight') keys.right = true;
+  if(e.key === 'ArrowUp'){ if(!keys.jump) jumpJustPressed = true; keys.jump = true; }
+  if(e.code === 'Space') keys.attack = true;
+  if(e.key.toLowerCase() === 'r') keys.restart = true;
+  if(audioCtx.state==='suspended') audioCtx.resume();
+});
+window.addEventListener('keyup', e=>{
+  if(e.key === 'ArrowLeft') keys.left = false;
+  if(e.key === 'ArrowRight') keys.right = false;
+  if(e.key === 'ArrowUp') keys.jump = false;
+  if(e.code === 'Space') keys.attack = false;
+  if(e.key.toLowerCase() === 'r') keys.restart = false;
+});
+
+/* -------------------- Level data (tilemap) --------------------
+   Each character:
+   . empty
+   # solid brick
+   B moving platform placeholder (converted to dynamic)
+   C collapsing platform
+   ^ spike
+   L lava (static or pit tile)
+   S checkpoint
+   f fake flag (fake exit)
+   F true flag
+   m mirror trigger
+   ? secret shortcut
+   e walker enemy
+   g flyer enemy
+   p shooter projectile enemy
+   T boss trigger
+   X fake platform (looks solid but passes through)
+   ---------------------------------------------------------- */
+const RAW = (()=>{
+  // create long level programmatically for length and challenge
+  const rows = 18, cols = 420;
+  const grid = Array.from({length:rows}, ()=> Array(cols).fill('.'));
+  // baseline ground
+  for(let x=0;x<cols;x++){
+    grid[rows-3][x] = '#';
+    if(x%20===0) grid[rows-2][x] = '#';
+  }
+  // opening gauntlet region: moving platform placements above lava pits
+  for(let x=6;x<60;x++){
+    if(x%6===0) grid[rows-5][x] = 'B';
+    if(x%5===0) grid[rows-2][x] = 'L';
+    if(x===36) { grid[rows-3][x] = '^'; grid[rows-4][x]='^'; }
+  }
+  // fake tempting platform that collapses
+  grid[rows-5][22] = 'C'; grid[rows-6][22] = 'C';
+  // vertical climb tower
+  for(let y=rows-4;y>3;y--){
+    grid[y][70] = '#';
+    grid[y][76] = '#';
+    if(y%3===0) grid[y][73] = 'C';
+  }
+  grid[rows-7][68] = 'g';
+  grid[rows-4][85] = 'e';
+  // mirror zone
+  for(let x=110;x<150;x++){
+    grid[rows-2][x] = '#';
+    if(x%7===0) grid[rows-5][x] = 'X'; // fake platform spots (tempting)
+    grid[rows-6][x] = 'm';
+  }
+  grid[rows-5][140] = 'f'; // fake flag
+  // long mid-section with traps and secret
+  for(let x=160;x<240;x++){
+    if(x%6===0) grid[rows-5][x] = 'B';
+    if(x%11===0) grid[rows-4][x] = 'X'; // more fake
+    if(x%9===0) grid[rows-3][x] = '^';
+    if(x%17===0) grid[rows-6][x] = 'g';
+    if(x%13===0) grid[rows-2][x] = 'p';
+  }
+  // rising lava chase prep
+  for(let x=260;x<320;x++){
+    if(x%5===0) grid[rows-5][x] = '#';
+    if(x%7===0) grid[rows-6][x] = 'B';
+    if(x%4===0) grid[rows-3][x] = 'p';
+  }
+  // boss area
+  for(let x=340;x<cols-6;x++){
+    grid[rows-2][x] = '#';
+  }
+  grid[rows-5][342] = 'T'; // boss trigger tile
+  // place true exit after boss
+  grid[rows-4][cols-8] = 'F';
+  // checkpoints
+  grid[rows-4][58] = 'S';
+  grid[rows-4][150] = 'S';
+  grid[rows-4][280] = 'S';
+  // secret shortcut
+  grid[rows-7][99] = '?';
+  // some spikes pits
+  for(let x=42;x<48;x++) grid[rows-3][x] = '^';
+  // enemies
+  grid[rows-4][30] = 'e'; grid[rows-6][190] = 'g'; grid[rows-4][205]='e'; grid[rows-4][210]='e';
+  // return as array of strings
+  return grid.map(r=>r.join(''));
+})();
+
+const LEVEL = {grid: RAW, w: RAW[0].length, h: RAW.length};
+
+/* -------------------- Utilities & Tile helpers -------------------- */
+function tileAt(tx,ty){
+  if(tx<0 || ty<0 || tx>=LEVEL.w || ty>=LEVEL.h) return '.';
+  return LEVEL.grid[ty][tx];
+}
+function setTile(tx,ty,ch){
+  if(tx<0 || ty<0 || tx>=LEVEL.w || ty>=LEVEL.h) return;
+  const row = LEVEL.grid[ty].split('');
+  row[tx] = ch;
+  LEVEL.grid[ty] = row.join('');
+}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function rectOverlap(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;}
+
+/* -------------------- Dynamic arrays -------------------- */
+const entities = []; // enemies, bullets
+const movingPlatforms = []; // {x,y,w,h,ax,range,t,dir,axis}
+let risingLavaActive = false;
+let risingLavaY = LEVEL.h * TILE + 200; // starts far below
+let bossActive = false, boss = null;
+let fakeExitUsed = false;
+let secretUsed = false;
+
+/* -------------------- Scan level to spawn dynamics -------------------- */
+function initEntitiesFromLevel(){
+  for(let ty=0; ty<LEVEL.h; ty++){
+    for(let tx=0; tx<LEVEL.w; tx++){
+      const ch = tileAt(tx,ty);
+      const x = tx*TILE, y = ty*TILE;
+      if(ch==='B'){ // convert tile to dynamic moving platform
+        movingPlatforms.push({x,y,w:TILE,h:TILE,ax:x,range:80,t:Math.random()*2,dir:Math.random()<0.5?1:-1,axis:'x'});
+        setTile(tx,ty,'.');
+      }
+      if(ch==='e'){ entities.push({kind:'walker',x:x,y:y,w:28,h:20,vx:-60,alive:true}); setTile(tx,ty,'.'); }
+      if(ch==='g'){ entities.push({kind:'flyer',x:x,y:y-16,w:26,h:26,alive:true}); setTile(tx,ty,'.'); }
+      if(ch==='p'){ entities.push({kind:'shooter',x:x,y:y,w:24,h:24,alive:true, timer:1 + Math.random()*2}); setTile(tx,ty,'.'); }
+    }
+  }
+}
+initEntitiesFromLevel();
+
+/* -------------------- Player -------------------- */
+const player = {
+  x: 2*TILE, y: (LEVEL.h-6)*TILE, w:28, h:30,
+  vx:0, vy:0, speed:220, dashSpeed:420,
+  onGround:false, jumpsLeft:2, facing:1, wallDir:0,
+  hearts:3, invul:0, checkpoint: {x:2*TILE,y:(LEVEL.h-6)*TILE}
+};
+
+/* populate checkpoint list */
+const checkpoints = [];
+for(let ty=0; ty<LEVEL.h; ty++){
+  for(let tx=0; tx<LEVEL.w; tx++){
+    if(tileAt(tx,ty)==='S') checkpoints.push({x:tx*TILE,y:ty*TILE});
+  }
+}
+if(checkpoints.length>3) checkpoints.length=3;
+
+/* -------------------- Helper: get nearby solids -------------------- */
+function getSolidsAround(rect){
+  const tiles = [];
+  const left = Math.floor(rect.x/TILE)-1;
+  const right = Math.floor((rect.x+rect.w)/TILE)+1;
+  const top = Math.floor(rect.y/TILE)-1;
+  const bottom = Math.floor((rect.y+rect.h)/TILE)+1;
+  for(let ty=top; ty<=bottom; ty++){
+    for(let tx=left; tx<=right; tx++){
+      const ch = tileAt(tx,ty);
+      if(ch==='#' || ch==='C' || ch==='X') tiles.push({tx,ty,ch,x:tx*TILE,y:ty*TILE,w:TILE,h:TILE});
+      // note: 'X' is fake platform visually drawn but will not block (we'll treat specially)
+    }
+  }
+  return tiles;
+}
+
+/* -------------------- Entities update -------------------- */
+function updateEntities(dt){
+  for(let i=entities.length-1;i>=0;i--){
+    const e = entities[i];
+    if(!e.alive) continue;
+    if(e.kind==='walker'){
+      e.x += e.vx * dt;
+      // turn on tile edge or collision
+      const foot = {x:e.x,y:e.y+e.h+2,w:e.w,h:2};
+      if(!getSolidsAround(foot).length) e.vx *= -1;
+      // hit player
+      if(rectOverlap(e,player) && player.invul<=0){
+        if(player.vy>120 && player.y+player.h < e.y+12){ // stomp
+          playStomp(); e.alive=false; player.vy=-300; player.jumpsLeft=2;
+        } else { player.hearts--; player.invul=1; if(player.hearts<=0) die(); }
+      }
+    } else if(e.kind==='flyer'){
+      e.x += Math.sin((Date.now()/500)+e.x) * dt * 60;
+      e.y += Math.cos((Date.now()/400)+e.y) * dt * 30;
+      if(rectOverlap(e,player) && player.invul<=0){
+        if(player.vy>120 && player.y+player.h < e.y+12){ playStomp(); e.alive=false; player.vy=-260; player.jumpsLeft=2; }
+        else { player.hearts--; player.invul=1; if(player.hearts<=0) die(); }
+      }
+    } else if(e.kind==='shooter'){
+      e.timer -= dt;
+      if(e.timer<=0){ e.timer = 1.2 + Math.random()*1.6;
+        entities.push({kind:'bullet',x:e.x,y:e.y,w:10,h:10,vx:-260,vy:0,alive:true});
+      }
+    } else if(e.kind==='bullet'){
+      e.vy += GRAV * dt * 0.01;
+      e.x += e.vx * dt; e.y += e.vy * dt;
+      if(rectOverlap(e,player) && player.invul<=0){ player.hearts--; player.invul=1; e.alive=false; if(player.hearts<=0) die(); }
+      if(e.x < -200 || e.x > LEVEL.w*TILE+200 || e.y > LEVEL.h*TILE+300) e.alive=false;
+    }
+  }
+  for(let i=entities.length-1;i>=0;i--) if(!entities[i].alive) entities.splice(i,1);
+}
+
+/* -------------------- Boss -------------------- */
+function spawnBoss(){
+  bossActive = true;
+  boss = {x:342*TILE,y:(LEVEL.h-7)*TILE - 120,w:180,h:120,health:12,timer:0};
+}
+function updateBoss(dt){
+  if(!boss) return;
+  boss.timer += dt;
+  if(boss.timer > 2.0){
+    boss.timer=0;
+    for(let i=0;i<4;i++){
+      entities.push({kind:'proj',x:boss.x+boss.w/2,y:boss.y+boss.h/2,w:12,h:12,vx:-200 - i*30,vy:-60 + i*30,alive:true});
+    }
+  }
+  boss.x += Math.sin(Date.now()/800)*0.4*dt*100;
+  boss.y += Math.sin(Date.now()/900)*0.2*dt*60;
+}
+
+/* -------------------- Player physics & controls -------------------- */
+function updatePlayer(dt){
+  if(!player) return;
+  player.invul = Math.max(0, player.invul - dt);
+
+  // mirror detection (tile 'm' nearby)
+  const cx = Math.floor((player.x + player.w/2)/TILE), cy = Math.floor((player.y + player.h/2)/TILE);
+  let mirrorActive = false;
+  for(let dx=-1; dx<=1; dx++) for(let dy=-1; dy<=1; dy++) if(tileAt(cx+dx,cy+dy)==='m') mirrorActive = true;
+  const leftControl = mirrorActive ? keys.right : keys.left;
+  const rightControl = mirrorActive ? keys.left : keys.right;
+
+  // horizontal input
+  let ax = 0;
+  if(leftControl) ax -= 1;
+  if(rightControl) ax += 1;
+
+  // dash (space) impulse
+  if(keys.attack){
+    player.vx = player.facing * player.dashSpeed;
+  } else {
+    const target = ax * player.speed;
+    player.vx += (target - player.vx) * clamp(12 * dt, 0, 1);
+  }
+  if(ax !== 0) player.facing = ax>0?1:-1;
+
+  // gravity
+  player.vy += GRAV * dt;
+
+  // apply horizontal movement + tile collision
+  player.x += player.vx * dt;
+  let rectH = {x:player.x,y:player.y,w:player.w,h:player.h};
+  let solids = getSolidsAround(rectH);
+  // include movingPlatforms as solids for h-collision
+  for(const mp of movingPlatforms) solids.push({x:mp.x,y:mp.y,w:mp.w,h:mp.h,tx:-1,ty:-1,ch:'M'});
+  for(const s of solids){
+    if(rectOverlap(rectH, s) && (s.ch !== 'X')){ // X = fake platform (no collide)
+      if(player.vx > 0) player.x = s.x - player.w - 0.01;
+      else if(player.vx < 0) player.x = s.x + s.w + 0.01;
+      player.vx = 0;
+      rectH.x = player.x;
+    }
+  }
+
+  // vertical movement + collision
+  player.y += player.vy * dt;
+  let rectV = {x:player.x,y:player.y,w:player.w,h:player.h};
+  solids = getSolidsAround(rectV);
+  for(const mp of movingPlatforms) solids.push({x:mp.x,y:mp.y,w:mp.w,h:mp.h,tx:-1,ty:-1,ch:'M'});
+  player.onGround = false;
+  for(const s of solids){
+    if(rectOverlap(rectV, s)){
+      if(player.vy > 0){
+        // landing
+        player.y = s.y - player.h - 0.01;
+        player.vy = 0;
+        player.onGround = true;
+        player.jumpsLeft = 2;
+        // collapsing platform behavior
+        if(s.ch === 'C') setTile(s.tx, s.ty, '.');
+      } else if(player.vy < 0){
+        player.y = s.y + s.h + 0.01; player.vy = 0;
+      }
+      rectV.y = player.y;
+    }
+  }
+
+  // wall slide / wall jump
+  const sideL = {x:player.x-1,y:player.y,w:1,h:player.h};
+  const sideR = {x:player.x+player.w,y:player.y,w:1,h:player.h};
+  const leftSolid = getSolidsAround(sideL).length > 0;
+  const rightSolid = getSolidsAround(sideR).length > 0;
+  player.wallDir = 0;
+  if(!player.onGround && (leftSolid || rightSolid)){
+    if(player.vy > 120) player.vy = 120;
+    player.wallDir = leftSolid ? -1 : 1;
+  }
+
+  // jump input (single press)
+  if(jumpJustPressed){
+    if(player.onGround || player.jumpsLeft>0 || player.wallDir!==0){
+      if(player.wallDir!==0){
+        player.vy = -520; player.vx = 240 * -player.wallDir; player.jumpsLeft = 1; playJump();
+      } else {
+        player.vy = -520; player.jumpsLeft--; playJump();
+      }
+    }
+  }
+
+  // hazards: spike or lava tile
+  const ptX = Math.floor((player.x + player.w/2)/TILE), ptY = Math.floor((player.y + player.h/2)/TILE);
+  const curTile = tileAt(ptX,ptY);
+  if(curTile === '^' || curTile === 'L') die();
+  if(player.y + player.h > risingLavaY && risingLavaActive) die();
+
+  // checkpoint activation
+  for(const cp of checkpoints){
+    if(Math.abs(player.x - cp.x) < TILE && Math.abs(player.y - cp.y) < TILE){
+      player.checkpoint.x = cp.x; player.checkpoint.y = cp.y - 6;
+    }
+  }
+  // fake exit
+  if(curTile === 'f'){
+    fakeExitUsed = true;
+    setTimeout(()=> restartToCheckpoint(), 250);
+  }
+  // secret
+  if(curTile === '?' && !secretUsed){
+    secretUsed = true;
+    player.x += 60 * TILE; // big warp forward
+    sfx(1200,0.05,'sine',0.12);
+  }
+  // boss trigger
+  if(curTile === 'T' && !bossActive) spawnBoss();
+
+  // fall below map
+  if(player.y > LEVEL.h * TILE + 300) die();
+
+  // reset jumpJustPressed flag
+  jumpJustPressed = false;
+}
+
+/* -------------------- Death and restart -------------------- */
+function die(){
+  deathCount++; playDeath();
+  player.alive = false;
+  setTimeout(()=> restartToCheckpoint(true), 500);
+}
+function restartToCheckpoint(soft=false){
+  player.x = player.checkpoint.x; player.y = player.checkpoint.y;
+  player.vx = 0; player.vy = 0; player.hearts = 3; player.invul = 1; player.alive = true;
+  // do not rebuild collapsed platforms (keeps punishment)
+}
+
+/* -------------------- Moving platforms update -------------------- */
+function updateMovingPlatforms(dt){
+  for(const mp of movingPlatforms){
+    if(mp.axis === 'x') mp.x = mp.ax + Math.sin(mp.t + Date.now()/700)*mp.range*mp.dir;
+    else mp.y = mp.ay + Math.sin(mp.t + Date.now()/700)*mp.range*mp.dir;
+    mp.t += dt;
+  }
+}
+
+/* -------------------- Rising lava control (change speed here) --------------------
+   To slow down: reduce the value (lavaRiseRate). This is pixels per second.
+   Example: lavaRiseRate = 20 (slow). Current default tuned to long run.
+-------------------------------------------------------------------------- */
+let lavaRiseRate = 16; // pixels per second (tweak to tune length)
+function updateRisingLava(dt){
+  // trigger zone: when player enters the chase area
+  if(player.x > 175*TILE && player.x < 245*TILE) {
+    if(!risingLavaActive){
+      risingLavaActive = true;
+      // spawn additional floating moving platforms to help escape
+      movingPlatforms.push({x:188*TILE,y:(LEVEL.h-7)*TILE - 2*TILE,ax:188*TILE,range:100,t:0,dir:1,axis:'x',w:2*TILE,h:TILE});
+      movingPlatforms.push({x:204*TILE,y:(LEVEL.h-8)*TILE - 2*TILE,ax:204*TILE,range:140,t:0,dir:-1,axis:'x',w:2*TILE,h:TILE});
+      movingPlatforms.push({x:220*TILE,y:(LEVEL.h-6)*TILE - 3*TILE,ax:220*TILE,range:80,t:0,dir:1,axis:'x',w:3*TILE,h:TILE});
+    }
+  }
+  if(risingLavaActive){
+    risingLavaY -= lavaRiseRate * dt;
+    risingLavaY = Math.max((LEVEL.h-6)*TILE, risingLavaY);
+  }
+}
+
+/* -------------------- Update loop for entities and game -------------------- */
+function updateAll(dt){
+  // single-press detect for jump
+  if(jumpJustPressed === false && keys.jump) { jumpJustPressed = true; } // already set in keydown handler
+  if(jumpJustPressed && !keys.jump) { jumpJustPressed = false; } // safety
+
+  // input restart
+  if(keys.restart) { restartToCheckpoint(); keys.restart = false; }
+
+  // update moving platforms and entities
+  updateMovingPlatforms(dt);
+  updateEntities(dt);
+  updateRisingLava(dt);
+  updatePlayer(dt);
+  if(bossActive) updateBoss(dt);
+}
+
+/* -------------------- Rendering -------------------- */
+function drawBackground(){
+  // corrupted sky gradient
+  const g = ctx.createLinearGradient(0,0,H,0);
+  g.addColorStop(0,'#330011'); g.addColorStop(1,'#050003');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  // parallax ruined castle silhouettes
+  ctx.save();
+  ctx.globalAlpha = 0.45;
+  ctx.fillStyle = '#070506';
+  for(let i=0;i<14;i++){
+    const bw = 60 + (i%3)*50;
+    const bx = (i*150 - (camera.x||0)*0.2) % (LEVEL.w*TILE);
+    ctx.fillRect((bx%W)-60, H-160 - (i%4)*20, bw, 220);
+  }
+  ctx.restore();
+}
+
+let camera = {x:0,y:0,w:W,h:H};
+function updateCamera(){
+  camera.x = clamp(player.x - W/2 + player.w/2, 0, LEVEL.w*TILE - W);
+  camera.y = clamp(player.y - H/2 + player.h/2, 0, LEVEL.h*TILE - H);
+}
+
+function drawTiles(){
+  const sx = Math.floor(camera.x / TILE), ex = Math.ceil((camera.x+W)/TILE);
+  for(let ty=0; ty<LEVEL.h; ty++){
+    for(let tx=sx-1; tx<=ex+1; tx++){
+      if(tx<0 || tx>=LEVEL.w) continue;
+      const ch = tileAt(tx,ty);
+      const x = tx*TILE - camera.x, y = ty*TILE - camera.y;
+      if(ch==='#'){
+        ctx.fillStyle = '#111'; ctx.fillRect(x,y,TILE,TILE);
+        ctx.strokeStyle = '#440000'; ctx.strokeRect(x+1,y+1,TILE-2,TILE-2);
+      } else if(ch==='^'){
+        ctx.fillStyle = '#999'; ctx.beginPath(); ctx.moveTo(x,y+TILE); ctx.lineTo(x+TILE/2,y+4); ctx.lineTo(x+TILE,y+TILE); ctx.fill();
+      } else if(ch==='L'){
+        ctx.fillStyle = '#440000'; ctx.fillRect(x,y,TILE,TILE); ctx.fillStyle = '#ff6600'; ctx.fillRect(x,y+TILE-8,TILE,8);
+      } else if(ch==='S'){
+        ctx.fillStyle = '#003300'; ctx.fillRect(x+8,y+8,16,16);
+      } else if(ch==='f' || ch==='F'){
+        ctx.fillStyle = ch==='F' ? '#00ff66' : '#ff3333';
+        ctx.fillRect(x+8,y,TILE-16,TILE);
+        ctx.fillStyle = '#000'; ctx.fillRect(x+10,y+6,8,4);
+      } else if(ch==='m'){
+        ctx.fillStyle = 'rgba(160,0,160,0.08)'; ctx.fillRect(x,y,TILE,TILE);
+      } else if(ch==='X'){ // fake platform visual
+        ctx.fillStyle = '#886e6e'; ctx.fillRect(x+2,y+2,TILE-4,TILE-4);
+      } else if(ch==='?'){
+        ctx.fillStyle='#8844ff'; ctx.fillRect(x+6,y+6,TILE-12,TILE-12);
+      }
+    }
+  }
+
+  // draw moving platforms
+  for(const mp of movingPlatforms){
+    const x = mp.x - camera.x, y = mp.y - camera.y;
+    ctx.fillStyle = '#332222'; ctx.fillRect(x,y, mp.w || TILE, mp.h || TILE);
+    ctx.strokeStyle = '#660000'; ctx.strokeRect(x,y, mp.w || TILE, mp.h || TILE);
+  }
+}
+
+function drawEntities(){
+  for(const e of entities){
+    if(!e.alive) continue;
+    const x = e.x - camera.x, y = e.y - camera.y;
+    if(e.kind==='walker'){ ctx.fillStyle = '#550000'; ctx.fillRect(x,y,e.w,e.h); ctx.fillStyle='#000'; ctx.fillRect(x+6,y+6,4,4); ctx.fillRect(x+e.w-12,y+6,4,4); }
+    if(e.kind==='flyer'){ ctx.fillStyle = '#772222'; ctx.beginPath(); ctx.ellipse(x+e.w/2,y+e.h/2,e.w/2,e.h/2,0,0,Math.PI*2); ctx.fill(); ctx.fillStyle='#000'; ctx.fillRect(x+6,y+6,4,4); }
+    if(e.kind==='bullet' || e.kind==='proj'){ ctx.fillStyle = '#ff6600'; ctx.fillRect(x,y,e.w,e.h); }
+  }
+  if(bossActive && boss){
+    const x = boss.x - camera.x, y = boss.y - camera.y;
+    ctx.fillStyle = '#003300'; ctx.fillRect(x,y,boss.w,boss.h);
+    ctx.fillStyle = '#ff0044'; ctx.fillRect(x+12,y+16,boss.w-24,boss.h-48);
+    ctx.fillStyle = '#fff'; ctx.fillRect(x+32,y+34,10,10); ctx.fillRect(x+boss.w-60,y+34,10,10);
+    // boss health bar
+    ctx.fillStyle = '#222'; ctx.fillRect(10,10,200,12);
+    ctx.fillStyle = '#ff5555'; ctx.fillRect(10,10, Math.max(2, (boss.health/12)*198), 12);
+  }
+}
+
+function drawPlayer(){
+  const x = player.x - camera.x, y = player.y - camera.y;
+  ctx.save();
+  if(player.invul>0 && Math.floor(player.invul*10)%2===0) ctx.globalAlpha = 0.4;
+  ctx.fillStyle = '#00ff66'; ctx.fillRect(x,y,player.w,player.h);
+  ctx.fillStyle = '#000'; ctx.fillRect(x+6,y+8,4,4); ctx.fillRect(x+player.w-12,y+8,4,4);
+  ctx.restore();
+}
+
+function drawLava(){
+  // rising lava rectangle
+  const ly = risingLavaY - camera.y;
+  ctx.fillStyle = '#662200'; ctx.fillRect(0, ly, W, H - ly);
+  // bubbling overlay
+  for(let i=0;i<10;i++){
+    const bx = (i*73 + Math.floor(Date.now()/120)%200) % (W);
+    ctx.fillStyle = 'rgba(255,120,0,0.06)';
+    ctx.fillRect(bx, ly + ((Date.now()/80 + i*13)%80), 6,6);
+  }
+}
+
+/* -------------------- Draw everything -------------------- */
+function render(){
+  ctx.clearRect(0,0,W,H);
+  drawBackground();
+  drawTiles();
+  drawEntities();
+  drawPlayer();
+  drawLava();
+
+  // HUD text
+  ctx.fillStyle = '#fff'; ctx.font='12px monospace';
+  ctx.fillText('Checkpoint: ' + Math.floor(player.checkpoint.x/TILE), 10, H - 10);
+}
+
+/* -------------------- Camera & background helper -------------------- */
+function drawBackground(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#330011'); g.addColorStop(1,'#050003');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  ctx.save();
+  ctx.globalAlpha = 0.4;
+  ctx.fillStyle = '#0b0505';
+  for(let i=0;i<20;i++){
+    const bw = 120 + (i%4)*30;
+    const hx = (i*260 - camera.x*0.15) % (LEVEL.w*TILE);
+    ctx.fillRect((hx%W)-80, H - 220 - (i%5)*18, bw, 260);
+  }
+  ctx.restore();
+}
+
+/* -------------------- Main loop -------------------- */
+function update(time){
+  if(!running) return;
+  if(!lastTime) lastTime = time;
+  let dt = (time - lastTime)/1000;
+  lastTime = time;
+  if(dt>0.06) dt = 0.06;
+
+  // set jumpJustPressed flag management
+  // (we set jumpJustPressed true at keydown earlier; here we use it)
+  // Note: jumpJustPressed toggled via global var.
+  updateAll(dt);
+  updateCamera();
+  render();
+
+  // update HUD hearts and timer/deaths
+  refreshHUD();
+
+  requestAnimationFrame(update);
+}
+
+/* -------------------- HUD refresh -------------------- */
+function refreshHUD(){
+  // hearts
+  const heartsDiv = document.getElementById('hearts');
+  heartsDiv.innerHTML = '';
+  for(let i=0;i<player.hearts;i++){
+    const d = document.createElement('div'); d.className='heart'; heartsDiv.appendChild(d);
+  }
+  // timer & deaths
+  document.getElementById('timer').innerText = formatTime(elapsedSeconds);
+  document.getElementById('deaths')?.remove?.(); // defensive
+}
+
+/* -------------------- Time util -------------------- */
+function formatTime(s){
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+}
+
+/* -------------------- Game flow: start / end / timer -------------------- */
+document.getElementById('start').style.display='block';
+document.getElementById('btn-start').onclick = ()=> {
+  document.getElementById('start').style.display='none';
+  startGame();
+};
+document.getElementById('btn-restart').onclick = ()=> location.reload();
+
+function startGame(){
+  running = true; lastTime = 0;
+  startTimer();
+  requestAnimationFrame(update);
+}
+function startTimer(){
+  if(timerInterval) clearInterval(timerInterval);
+  const start = Date.now();
+  timerInterval = setInterval(()=>{ elapsedSeconds = Math.floor((Date.now()-start)/1000); document.getElementById('timer').innerText = formatTime(elapsedSeconds); }, 250);
+}
+function endGame(win){
+  running = false;
+  if(timerInterval){ clearInterval(timerInterval); timerInterval = null; }
+  const endPanel = document.getElementById('end');
+  document.getElementById('end-title').innerText = win ? 'YOU BROKE THE CASTLE' : 'YOU DIED';
+  document.getElementById('end-msg').innerText = win ? 'Corruption receded... for now.' : 'Fall back. Try again.';
+  document.getElementById('end-time').innerText = formatTime(elapsedSeconds);
+  document.getElementById('end-deaths').innerText = deathCount;
+  document.getElementById('end').style.display='block';
+  if(win) playWin(); else playDeath();
+}
+
+/* -------------------- Collision utility (for simpler blocks) -------------------- */
+function resolveCollisionRect(a,b){
+  // minimal separation resolution used earlier in simpler snippet; not heavily used here
+  const aw = a.w, ah = a.h, bw = b.w, bh = b.h;
+  const dx = (a.x + aw/2) - (b.x + bw/2);
+  const dy = (a.y + ah/2) - (b.y + bh/2);
+  const awb = (aw + bw)/2, ahb = (ah + bh)/2;
+  if(Math.abs(dx) <= awb && Math.abs(dy) <= ahb){
+    const wy = awb * dy, hx = ahb * dx;
+    if(wy > hx){
+      if(wy > -hx){ // bottom
+        a.y = b.y + bh; a.vy = 0;
+      } else { // left
+        a.x = b.x - aw; a.vx = 0;
+      }
+    } else {
+      if(wy > -hx){ // right
+        a.x = b.x + bw; a.vx = 0;
+      } else { // top
+        a.y = b.y - ah; a.vy = 0; a.onGround = true;
+      }
+    }
+  }
+}
+
+/* -------------------- Win check and boss defeat handling -------------------- */
+function checkWin(){
+  // true flag tile
+  const tx = Math.floor((player.x + player.w/2)/TILE), ty = Math.floor((player.y + player.h/2)/TILE);
+  if(tileAt(tx,ty)==='F' && !bossActive) {
+    endGame(true);
+  }
+  if(bossActive && boss && boss.health <= 0){
+    bossActive = false; boss = null;
+  }
+}
+
+/* -------------------- Main game tick wrapper -------------------- */
+function updateAll(dt){
+  // Jump single-press handling: if key pressed this frame (keydown sets jumpJustPressed true)
+  // We'll rely on jumpJustPressed variable set by keydown earlier
+  // (ensure we capture it exactly once)
+  const prevJump = jumpJustPressed;
+  // Use prevJump inside player update; we must reset it afterwards
+  // We keep global jumpJustPressed true only when the keydown occurred; reset after processing.
+  updateEntities(dt);
+  updateMovingPlatforms(dt);
+  updateRisingLava(dt);
+  updatePlayer(dt);
+  if(bossActive) updateBoss(dt);
+  checkWin();
+  // reset single press
+  jumpJustPressed = false;
+}
+
+/* -------------------- Startup initialization tweaks -------------------- */
+function initialSetup(){
+  // adjust player spawn if secret or saved checkpoint exists
+  player.x = 2*TILE; player.y = (LEVEL.h-6)*TILE;
+  player.checkpoint = {x:player.x, y:player.y};
+  player.hearts = 3; player.invul = 0; player.alive = true;
+  // set initial risingLavaY to bottom of world
+  risingLavaY = LEVEL.h * TILE + 200;
+  // populate HUD with hearts
+  refreshHUD();
+}
+initialSetup();
+
+/* -------------------- tiny AI helpers to make some sections trickier on purpose -------------------- */
+/* Periodically convert some visible tiles (X) to fake or collapse some C tiles after touching them
+   This creates deceptive spots where the obvious platform kills the player. */
+(function deceptiveTick(){
+  // Randomly choose an 'X' tile (fake platform visually) and highlight it (already fake) — on touch player falls
+  // Also occasionally make a visible safe brick behave like collapsing (swap '#' -> 'C') to trick player.
+  setInterval(()=>{
+    // pick random tile to collapse after first touch (makes traps)
+    for(let ty=0; ty<LEVEL.h; ty++){
+      for(let tx=0; tx<LEVEL.w; tx++){
+        if(Math.random() < 0.0006 && tileAt(tx,ty)==='#'){
+          setTile(tx,ty,'C'); // becomes collapsing
+        }
+      }
+    }
+  }, 3700);
+})();
+
+/* -------------------- Boss spawn link -------------------- */
+function spawnBoss(){
+  if(bossActive) return;
+  spawnBoss = null; // prevent multiple
+  bossActive = true;
+  boss = {x:342*TILE,y:(LEVEL.h-7)*TILE - 120,w:160,h:120,health:12,timer:0};
+}
+
+/* -------------------- Death flow: conservative, immediate restart to checkpoint -------------------- */
+function restartToCheckpoint(){
+  player.x = player.checkpoint.x; player.y = player.checkpoint.y;
+  player.vx = 0; player.vy = 0; player.hearts = 3; player.invul = 1; player.alive = true;
+}
+
+/* -------------------- set up some UI quick helpers (timer, deaths) -------------------- */
+(function uiLoop(){
+  setInterval(()=>{
+    document.getElementById('timer').innerText = formatTime(elapsedSeconds);
+    elapsedSeconds++;
+    // force redraw of hearts panel
+    const heartsDiv = document.getElementById('hearts');
+    heartsDiv.innerHTML = '';
+    for(let i=0;i<player.hearts;i++){ const d=document.createElement('div'); d.className='heart'; heartsDiv.appendChild(d); }
+    // show death count small
+    let dd = document.getElementById('death-counter');
+    if(!dd){ dd = document.createElement('div'); dd.id='death-counter'; dd.className='panel muted'; dd.style.position='absolute'; dd.style.right='12px'; dd.style.top='12px'; dd.style.zIndex='40'; document.body.appendChild(dd); }
+    dd.innerText = 'Deaths: ' + deathCount;
+  }, 1000);
+})();
+
+/* -------------------- Kick off rendering loop -------------------- */
+requestAnimationFrame(update);
+
+/* -------------------- NOTE for tweaking lava rise speed --------------------
+   You can change the lavaRiseRate variable near the top of the file to make the chase easier/harder.
+   - For ~15 minute very slow rise, use 6-10 px/sec.
+   - For faster punishing runs, 25-60 px/sec.
+-------------------------------------------------------------------------- */
+
+</script>
+</body>
+</html>
